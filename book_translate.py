@@ -4,15 +4,18 @@ book_translate.py: translate a book PDF into another language, keeping tone and 
 
 Pipeline
   1. Extract text from the input PDF (PyMuPDF), rebuild paragraphs, drop page numbers.
+     Headings are recognized by font size (book title / part / section) and carried
+     through translation as #, ## and ### markers.
   2. Style pass: Claude reads the opening and writes a short style guide plus a
      glossary (names, nicknames, invented words, running jokes) with chosen renderings.
-  3. Translate one whole chapter per call (chapters are found from headings such as
-     "Глава 3"; very long chapters, or books without headings, are split at paragraph
-     boundaries). Every call gets the style guide, the glossary and the end of the
+  3. Translate one whole chapter per call (chapters are found from headings; short
+     ones, such as one-page stories, are packed together; very long chapters, or books
+     without headings, are split at paragraph boundaries). Every call gets the style guide, the glossary and the end of the
      previous translated chapter, so voice and names stay consistent.
   4. Revision pass: a second call compares source and draft and fixes lost jokes,
      flattened voice, mistranslations, unnatural phrasing and glossary drift.
-  5. Typeset the result as a clean PDF (full Romanian diacritics).
+  5. Typeset the result as a clean PDF (full Romanian diacritics), with the translated
+     title and author on the cover and proper chapter headings.
 
 Progress is saved after every step (<output>.progress.json), so an interrupted run
 resumes where it stopped.
@@ -44,6 +47,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import pymupdf
@@ -53,7 +57,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import CondPageBreak, PageBreak, Paragraph, SimpleDocTemplate, Spacer
 from xml.sax.saxutils import escape
 
 LANG_NAMES = {"ru": "Russian", "ro": "Romanian", "en": "English", "uk": "Ukrainian",
@@ -65,6 +69,20 @@ MAX_CHAPTER_WORDS = 7000
 MAX_OUTPUT_TOKENS = 32000
 HEADING_RE = re.compile(r"^(глава|часть|chapter|part|capitolul|partea)\b|^[IVXLC]+\.?$|^\d{1,3}\.?$",
                         re.IGNORECASE)
+# Headings travel through the pipeline as Markdown-style markers:
+# "# " book title, "## " part or chapter, "### " section or story.
+MARKED_RE = re.compile(r"^(#{1,3})[ \t]+(.+)$", re.S)
+
+
+def heading_level(p):
+    """1-3 for a paragraph marked as a heading, 0 for body text."""
+    m = MARKED_RE.match(p)
+    return len(m.group(1)) if m else 0
+
+
+def heading_text(p):
+    m = MARKED_RE.match(p)
+    return m.group(2).strip() if m else p
 
 
 # ---------- 1. extraction ----------
@@ -80,6 +98,57 @@ def parse_pages(spec, n):
     return out
 
 
+def _page_lines(page):
+    """(text, font size, block number) for every text line on a page, in reading order."""
+    out = []
+    for bno, block in enumerate(page.get_text("dict", sort=True)["blocks"]):
+        for line in block.get("lines", []):
+            text = "".join(s["text"] for s in line["spans"]).strip()
+            if text:
+                size = max(line["spans"], key=lambda s: len(s["text"].strip()))["size"]
+                out.append((text, round(size, 1), bno))
+    return out
+
+
+def heading_sizes(doc, page_list):
+    """Map font sizes clearly larger than the body text to heading levels.
+    A size used on only a few lines, above all others, is the book title (1);
+    the rest, largest first, are parts/chapters (2) and sections (3)."""
+    chars, lines = Counter(), Counter()
+    for i in page_list:
+        for text, size, _ in _page_lines(doc[i]):
+            chars[size] += len(text)
+            lines[size] += 1
+    if not chars:
+        return {}
+    body = chars.most_common(1)[0][0]
+    # headings are short lines; a big size with long lines is body text in another style
+    sizes = sorted((s for s in chars if s >= body * 1.12 and chars[s] / lines[s] < 80),
+                   reverse=True)
+    levels = {}
+    if len(sizes) > 1 and lines[sizes[0]] <= 3:
+        levels[sizes.pop(0)] = 1
+    for n, size in enumerate(sizes):
+        levels[size] = min(2 + n, 3)
+    return levels
+
+
+def _text_blocks(page, levels):
+    """Raw text blocks for one page; heading lines become their own marked block."""
+    blocks, cur, cur_key = [], [], None
+    for text, size, bno in _page_lines(page):
+        level = levels.get(size, 0) if sum(c.isalpha() for c in text) >= 2 else 0
+        key = (bno, level)
+        if cur and key != cur_key:
+            blocks.append((cur_key[1], cur))
+            cur = []
+        cur.append(text)
+        cur_key = key
+    if cur:
+        blocks.append((cur_key[1], cur))
+    return [("#" * lvl + " " + " ".join(ls)) if lvl else "\n".join(ls) for lvl, ls in blocks]
+
+
 def extract_paragraphs(pdf_path, pages_spec=None, ocr=None, ocr_mode="auto", ocr_cache=None,
                        on_ocr=None):
     """ocr: function(png_bytes) -> text, used for pages without a text layer (or all pages
@@ -88,9 +157,10 @@ def extract_paragraphs(pdf_path, pages_spec=None, ocr=None, ocr_mode="auto", ocr
     paras, buf = [], ""
     ocr_cache = {} if ocr_cache is None else ocr_cache
     page_list = parse_pages(pages_spec, doc.page_count)
+    levels = heading_sizes(doc, page_list)
     for i in page_list:
         page = doc[i]
-        blocks = [b[4] for b in page.get_text("blocks", sort=True) if b[6] == 0]
+        blocks = _text_blocks(page, levels)
         has_text = len("".join(blocks).strip()) >= 30
         if ocr and ocr_mode != "off" and (ocr_mode == "force" or not has_text):
             key = str(i)
@@ -105,6 +175,11 @@ def extract_paragraphs(pdf_path, pages_spec=None, ocr=None, ocr_mode="auto", ocr
             text = raw.strip()
             if not text or re.fullmatch(r"[\d\s\-–—.]+", text):   # page numbers
                 continue
+            if heading_level(text):
+                if buf:
+                    paras.append(buf)
+                buf = re.sub(r"\s+", " ", text)
+                continue
             # pull chapter headings out onto their own paragraph
             lines = [l.strip() for l in text.split("\n")]
             pieces, cur = [], []
@@ -112,7 +187,9 @@ def extract_paragraphs(pdf_path, pages_spec=None, ocr=None, ocr_mode="auto", ocr
                 if HEADING_RE.match(l) and len(l) < 60:
                     if cur:
                         pieces.append("\n".join(cur))
-                    pieces.append(l)
+                    # "Глава 3" / "Chapter 3" is a chapter; a bare "3" or "IV" a section
+                    pieces.append(("## " if l[:1].isalpha() and not re.fullmatch(r"[IVXLC]+\.?", l)
+                                   else "### ") + l)
                     cur = []
                 else:
                     cur.append(l)
@@ -125,7 +202,8 @@ def extract_paragraphs(pdf_path, pages_spec=None, ocr=None, ocr_mode="auto", ocr
                 if not piece:
                     continue
                 # a block starting lowercase continues the previous one (page break mid-paragraph)
-                if buf and piece[:1].islower() and not HEADING_RE.match(buf):
+                if buf and piece[:1].islower() and not heading_level(buf) \
+                        and not heading_level(piece):
                     buf += " " + piece
                 else:
                     if buf:
@@ -140,19 +218,26 @@ def extract_paragraphs(pdf_path, pages_spec=None, ocr=None, ocr_mode="auto", ocr
 
 
 def split_chapters(paras, max_words=MAX_CHAPTER_WORDS):
-    """One unit per chapter; over-long chapters (or heading-less books) split at paragraphs."""
+    """One unit per chapter; short chapters (one-page stories, front matter) are packed
+    together up to max_words; over-long chapters (or heading-less books) split at paragraphs."""
+    def words(ps):
+        return sum(len(p.split()) for p in ps)
+
     chapters, cur = [], []
     for p in paras:
-        if HEADING_RE.match(p) and len(p) < 60 and cur:
+        if heading_level(p) and cur and not all(heading_level(q) for q in cur):
             chapters.append(cur)
             cur = []
         cur.append(p)
     if cur:
         chapters.append(cur)
-    # short front matter before the first heading rides along with chapter 1
-    if len(chapters) > 1 and sum(len(p.split()) for p in chapters[0]) < 300:
-        chapters[1] = chapters[0] + chapters[1]
-        chapters.pop(0)
+    packed = []
+    for ch in chapters:
+        if packed and words(packed[-1]) + words(ch) <= max_words:
+            packed[-1] = packed[-1] + ch
+        else:
+            packed.append(ch)
+    chapters = packed
 
     def split_long_paragraph(p, limit):
         # PDFs without paragraph spacing can extract as one huge block; cut at sentence ends
@@ -179,7 +264,7 @@ def split_chapters(paras, max_words=MAX_CHAPTER_WORDS):
         part, n = [], 0
         for p in ch:
             w = len(p.split())
-            heading_only = len(part) == 1 and HEADING_RE.match(part[0])
+            heading_only = all(heading_level(q) for q in part)
             if part and n + w > target and not heading_only:
                 units.append(part)
                 part, n = [], 0
@@ -237,22 +322,28 @@ class Translator:
                                          "data": base64.b64encode(png_bytes).decode()}},
             {"type": "text", "text": f"""Transcribe the {self.src} text on this book page exactly, character for character.
 - One paragraph per block, blocks separated by a blank line; join lines inside a paragraph and rejoin words hyphenated across lines.
-- Chapter titles on their own line.
+- Titles on their own line, marked like Markdown: "# " for the book title, "## " for a part
+  or chapter title, "### " for a section or story title. Don't mark anything else.
 - Skip running headers, page numbers and illustration captions.
 - If the page has no text, output nothing.
 Output only the transcription."""},
         ]
         return self._call("You are a precise OCR transcriber.", content, max_tokens=8000)
 
-    def style_guide(self, sample):
+    def style_guide(self, sample, file_name=""):
         if self.dry_run:
-            return "STYLE (dry run)\nGLOSSARY (dry run)"
+            return "TITLE:\nAUTHOR:\nSTYLE (dry run)\nGLOSSARY (dry run)"
         system = (f"You are a senior literary translator from {self.src} into {self.tgt}, "
                   f"specializing in humorous and children's literature.")
         user = f"""Read this opening of a book and prepare notes for translating the whole book into {self.tgt}.
 Audience: {self.audience}.
 
-Write two sections, plain text, under 600 words total:
+Start with exactly two lines, for the cover of the translated book:
+TITLE: the book's title translated into {self.tgt} as a published translation would title it
+AUTHOR: the author's name as {self.tgt} books write it (empty if unknown)
+Use the opening and the file name ("{file_name}") as clues; leave out years, editions and "translated".
+
+Then write two sections, plain text, under 600 words total:
 
 STYLE
 - narrator's voice, register, sentence rhythm, how the humor works (situational, wordplay,
@@ -270,14 +361,15 @@ OPENING:
 
     def translate(self, text, guide, prev_tail):
         if self.dry_run:
-            return "\n\n".join(f"[{self.tgt_code}] {p}" for p in text.split("\n\n"))
+            return "\n\n".join(re.sub(r"^((?:#{1,3} )?)", rf"\1[{self.tgt_code}] ", p)
+                               for p in text.split("\n\n"))
         system = f"""You are a senior literary translator from {self.src} into {self.tgt}, specializing in humorous and children's literature. Audience: {self.audience}.
 
 Goal: a translation a native {self.tgt} reader enjoys as if the book were written in {self.tgt}, with the same laughs in the same places.
 - Preserve meaning, tone, voice, pacing and every joke. When a joke depends on wordplay that cannot survive literally, recreate an equivalent joke in {self.tgt} that fits the scene.
 - Natural, idiomatic {self.tgt}; never calque {self.src} syntax. Dialogue should sound spoken.
 - Follow the style guide and glossary exactly; keep names consistent.
-- Keep the paragraph structure: same number of paragraphs, separated by one blank line. Chapter headings stay on their own line.
+- Keep the paragraph structure: same number of paragraphs, separated by one blank line. Headings start with #, ## or ###: keep that marker exactly and translate the text after it.
 - Use correct orthography and diacritics. For Romanian: ă â î ș ț (comma-below, not cedilla) and Romanian quotation marks „...”, dialogue dashes as in the source.
 - Output only the translation. No notes, no commentary.
 
@@ -303,7 +395,7 @@ Compare the draft translation with the source, then produce the final, revised t
 5. Consistency with the style guide and glossary (names, nicknames, recurring phrases).
 6. Orthography: correct diacritics (for Romanian: ă â î ș ț with comma-below), quotation marks and dialogue punctuation.
 
-Change only what improves the text; keep good passages as they are. Keep the same paragraphs, separated by one blank line, headings on their own line.
+Change only what improves the text; keep good passages as they are. Keep the same paragraphs, separated by one blank line. Headings start with #, ## or ###: keep those markers exactly.
 Output only the final translation. No notes, no commentary, no list of changes.
 
 STYLE GUIDE AND GLOSSARY:
@@ -315,6 +407,24 @@ STYLE GUIDE AND GLOSSARY:
 
 
 # ---------- 4. typesetting ----------
+
+def split_title_pages(paras):
+    """Separate the book's own title pages (author, title, "Stories", publisher, city and
+    year) from the text: the short lines before the first section heading or real
+    paragraph, when they include the book's title. The cover replaces them.
+    Returns (title, remaining paragraphs)."""
+    end = next((i for i, p in enumerate(paras) if heading_level(p) in (2, 3)
+                or (not heading_level(p) and len(p.split()) >= 12)), len(paras))
+    front = paras[:end]
+    titles = [heading_text(p) for p in front if heading_level(p) == 1]
+    if not titles or end > 20:
+        return "", paras
+    rest = paras[end:]
+    # a different big heading right before the text opens it (e.g. the first part)
+    if heading_level(front[-1]) == 1 and heading_text(front[-1]).lower() != titles[0].lower():
+        rest = [front[-1]] + rest
+    return titles[0], rest
+
 
 def find_font():
     candidates = [
@@ -330,29 +440,43 @@ def find_font():
     sys.exit("No Unicode serif font found; pass --font /path/to/font.ttf")
 
 
-def build_pdf(paragraphs, out_path, title, font_path=None):
+def build_pdf(paragraphs, out_path, title, author="", font_path=None):
     reg, bold = (font_path, font_path) if font_path else find_font()
     pdfmetrics.registerFont(TTFont("Body", reg))
     pdfmetrics.registerFont(TTFont("BodyBold", bold))
     body = ParagraphStyle("body", fontName="Body", fontSize=11, leading=15.5,
                           alignment=TA_JUSTIFY, firstLineIndent=5 * mm, spaceAfter=2)
-    head = ParagraphStyle("head", fontName="BodyBold", fontSize=15, leading=20,
-                          alignment=TA_CENTER, spaceBefore=6 * mm, spaceAfter=6 * mm)
-    ttl = ParagraphStyle("title", parent=head, fontSize=20, leading=26, spaceBefore=40 * mm)
+    part = ParagraphStyle("part", fontName="BodyBold", fontSize=17, leading=22, keepWithNext=1,
+                          alignment=TA_CENTER, spaceBefore=20 * mm, spaceAfter=10 * mm)
+    section = ParagraphStyle("section", fontName="BodyBold", fontSize=12.5, leading=16,
+                             keepWithNext=1, alignment=TA_CENTER, spaceBefore=6 * mm,
+                             spaceAfter=3 * mm)
+    ttl = ParagraphStyle("title", parent=part, fontSize=22, leading=28, spaceBefore=45 * mm)
+    byline = ParagraphStyle("author", parent=part, fontName="Body", fontSize=13, leading=18,
+                            spaceBefore=0, spaceAfter=0)
 
-    story = [Paragraph(escape(title), ttl), PageBreak()]
+    story = ([Paragraph(escape(author), byline)] if author else []) + [Paragraph(escape(title), ttl)]
+    story.append(PageBreak())
     for p in paragraphs:
-        if HEADING_RE.match(p) or (len(p) < 60 and p.isupper()):
-            story += [Spacer(1, 4 * mm), Paragraph(escape(p), head)]
+        level = heading_level(p)
+        if not level and (HEADING_RE.match(p) or (len(p) < 60 and p.isupper())):
+            level = 3
+        text = escape(heading_text(p))
+        if level in (1, 2):
+            if not isinstance(story[-1], PageBreak):
+                story.append(PageBreak())
+            story.append(Paragraph(text, part))
+        elif level == 3:
+            story += [CondPageBreak(30 * mm), Paragraph(text, section)]
         else:
-            story.append(Paragraph(escape(p), body))
+            story.append(Paragraph(text, body))
 
     def page_no(canvas, doc):
         canvas.setFont("Body", 9)
         canvas.drawCentredString(A5[0] / 2, 10 * mm, str(doc.page))
 
     SimpleDocTemplate(str(out_path), pagesize=A5, leftMargin=16 * mm, rightMargin=16 * mm,
-                      topMargin=16 * mm, bottomMargin=18 * mm, title=title
+                      topMargin=16 * mm, bottomMargin=18 * mm, title=title, author=author
                       ).build(story, onLaterPages=page_no)
 
 
@@ -366,7 +490,8 @@ def main():
     ap.add_argument("--target", default="ro")
     ap.add_argument("--audience", default="children aged 5-10 and the parents reading aloud to them")
     ap.add_argument("--pages", help="e.g. 1-20 or 3,5,9-12 (1-based)")
-    ap.add_argument("--title", help="title for the output PDF (default: input file name)")
+    ap.add_argument("--title", help="title for the cover (default: the translated title)")
+    ap.add_argument("--author", help="author for the cover (default: from the book)")
     ap.add_argument("--model", default=DEFAULT_MODEL,
                     help=f"model ID (default: {DEFAULT_MODEL}; or set BOOK_TRANSLATE_MODEL)")
     ap.add_argument("--revise-model", help="model for the revision pass (default: same as --model)")
@@ -404,7 +529,8 @@ def main():
     if "guide" not in state:
         sample = "\n\n".join(p for u in units[:2] for p in u)[:15000]
         print("Writing style guide and glossary...")
-        state.update(guide=tr.style_guide(sample), n_units=len(units), done=[], draft=None)
+        state.update(guide=tr.style_guide(sample, Path(args.input).stem),
+                     n_units=len(units), done=[], draft=None)
         save()
         print(state["guide"], "\n")
 
@@ -427,7 +553,13 @@ def main():
         save()
 
     out_paras = [p.strip() for t in done for p in re.split(r"\n\s*\n", t) if p.strip()]
-    build_pdf(out_paras, out, args.title or Path(args.input).stem, args.font)
+    # the last TITLE:/AUTHOR: line wins, in case the model corrected itself
+    meta = {k: (re.findall(rf"^{k}:[ \t]*(.*)$", state["guide"], re.M) or [""])[-1].strip()
+            for k in ("TITLE", "AUTHOR")}
+    own_title, out_paras = split_title_pages(out_paras)
+    title = args.title or meta["TITLE"] or own_title or Path(args.input).stem
+    author = meta["AUTHOR"] if args.author is None else args.author
+    build_pdf(out_paras, out, title, author, args.font)
     guide_path = out.with_suffix(".glossary.txt")
     guide_path.write_text(state["guide"])
     progress_path.unlink()

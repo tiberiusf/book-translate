@@ -22,18 +22,27 @@ generic prose. This script is built around avoiding exactly that:
   works, and a glossary of every name, nickname, diminutive, invented word
   and running joke with one chosen rendering. Every later call follows it,
   so "Пушок" is the same character on page 3 and page 300.
-- **Whole chapters, with continuity.** Chapters are detected from headings
-  ("Глава 3", "Chapter 3", Roman numerals, ...) and translated one per call,
-  each with the end of the previous translated chapter for context. Very
-  long chapters (or books without headings) are split at paragraph
-  boundaries, never mid-sentence.
+- **Whole chapters, with continuity.** Chapters are translated one per
+  call, each with the end of the previous translated chapter for context.
+  Books made of many short pieces (one-page stories) have them packed
+  together into calls of up to ~7,000 words; very long chapters (or books
+  without headings) are split at paragraph boundaries, never mid-sentence.
 - **A separate revision pass.** A second call acts as editor: it compares
   source and draft and fixes lost jokes, flattened voice, calques,
   mistranslations and glossary drift. Puns that died in translation are
   recreated, not explained. Skip it with `--no-revise` to halve the cost.
-- **Proper typesetting.** Output is a clean A5 book PDF with a Unicode
-  font, so Romanian diacritics (ă â î ș ț with comma-below) and Cyrillic
-  render correctly.
+- **The book's structure survives.** Headings are recognized by font size
+  (book title, parts, chapters/stories) or, in scans, by Claude while it
+  reads the page, and are carried through translation as markers. The
+  output has parts starting on a new page and centered section titles.
+- **Scanned books work too.** Pages with no text layer are read with
+  Claude vision automatically, and the transcription is cached in the
+  progress file so a rerun never pays for OCR twice.
+- **Proper typesetting.** Output is a clean A5 book PDF: a cover with the
+  translated title and the author's name (instead of the source file name;
+  the original's own title pages are dropped), and a Unicode font, so
+  Romanian diacritics (ă â î ș ț with comma-below) and Cyrillic render
+  correctly.
 
 ## What makes it resilient
 
@@ -94,18 +103,19 @@ and glossary Claude used, handy for checking its choices.
 | `--source` / `--target` | `ru` / `ro` | Language codes (or names) to translate from and into. |
 | `--audience` | children 5-10 and parents | Who the translation is for; shapes register and word choice. |
 | `--pages` | all | 1-based pages to use, e.g. `1-20` or `3,5,9-12`. |
-| `--title` | input file name | Title on the output PDF's first page. |
+| `--title` | translated title | Title on the cover. |
+| `--author` | from the book | Author on the cover (`--author ""` for none). |
 | `--model` | `claude-opus-5-5` | Model for translation. `BOOK_TRANSLATE_MODEL` env var sets it for every run. |
 | `--revise-model` | same as `--model` | A different model for the revision pass. |
 | `--no-revise` | off | Skip the revision pass (cheaper, faster). |
 | `--max-chapter-words` | `7000` | Split chapters longer than this. Lower it if output gets cut off. |
+| `--ocr` | `auto` | `auto`: OCR pages without a text layer with Claude vision; `force`: OCR every page (when the text layer is garbage); `off`: never. |
 | `--font` | auto | Path to a TTF font with full diacritics. |
 | `--dry-run` | off | No API calls; tests extraction, chapter splitting and layout. |
 
 ## Limitations
 
-- Needs a text layer. Scanned books (images only) must be OCR'd first,
-  e.g. `ocrmypdf -l rus in.pdf out.pdf`.
+- OCR of scanned pages costs one API call per page, on top of translation.
 - Output is text only: illustrations and original layout are not carried over.
 - Use it only for public-domain works, works you hold the rights to, or
   uses covered by fair use.
